@@ -1,1 +1,4 @@
-
+DynamoDB needs setting up some as environment variables.
+AWS Access Key ID: "fakeMyKeyId"
+AWS Secret Access Key: "fakeSecretAccessKey"
+https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.DownloadingAndRunning.html
