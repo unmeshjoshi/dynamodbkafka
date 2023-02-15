@@ -11,6 +11,7 @@ import com.amazonaws.services.dynamodbv2.local.main.ServerRunner;
 import com.amazonaws.services.dynamodbv2.local.server.DynamoDBProxyServer;
 import com.amazonaws.services.dynamodbv2.model.ConditionalCheckFailedException;
 import com.amazonaws.services.dynamodbv2.model.ProvisionedThroughput;
+import com.google.common.util.concurrent.Uninterruptibles;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.*;
@@ -27,6 +28,7 @@ import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.utility.DockerImageName;
 
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static org.apache.kafka.clients.admin.AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG;
@@ -173,10 +175,16 @@ public class DynamoDBKafkaTest {
                 updateRecordInDynamoDB(vehicleMessage, kafkaOffset, mapper);
                 return;
             } catch (ConditionalCheckFailedException e) {
+                //wait for random duration from 0 - 200ms before retry.
+                randomDelay();
                 e.printStackTrace();
                 //continue with retry.
             }
         }
+    }
+
+    private static void randomDelay() {
+        Uninterruptibles.sleepUninterruptibly(new Random().nextLong(0, 200), TimeUnit.MILLISECONDS);
     }
 
     private static void updateRecordInDynamoDB(VehicleMessage vehicleMessage, long kafkaOffset, DynamoDBMapper mapper) {
