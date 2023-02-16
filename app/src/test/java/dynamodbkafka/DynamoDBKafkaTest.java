@@ -3,142 +3,85 @@
  */
 package dynamodbkafka;
 
-import com.amazonaws.client.builder.AwsClientBuilder;
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
 import com.amazonaws.services.dynamodbv2.datamodeling.DynamoDBMapper;
-import com.amazonaws.services.dynamodbv2.local.main.ServerRunner;
-import com.amazonaws.services.dynamodbv2.local.server.DynamoDBProxyServer;
 import com.amazonaws.services.dynamodbv2.model.ConditionalCheckFailedException;
-import com.amazonaws.services.dynamodbv2.model.ProvisionedThroughput;
 import com.google.common.util.concurrent.Uninterruptibles;
-import org.apache.kafka.clients.admin.AdminClient;
-import org.apache.kafka.clients.admin.NewTopic;
+import dynamodbkafka.utils.LocalDynamoDB;
+import dynamodbkafka.utils.LocalKafka;
+import dynamodbkafka.utils.TestUtils;
 import org.apache.kafka.clients.consumer.*;
-import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.common.serialization.ByteArrayDeserializer;
-import org.apache.kafka.common.serialization.ByteArraySerializer;
-import org.apache.kafka.common.serialization.StringDeserializer;
-import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.common.TopicPartition;
 import org.jetbrains.annotations.NotNull;
 import org.junit.Before;
 import org.junit.Test;
-import org.testcontainers.containers.KafkaContainer;
-import org.testcontainers.utility.DockerImageName;
 
+import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
-import static org.apache.kafka.clients.admin.AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG;
 import static org.junit.Assert.assertEquals;
 
-class DynamoDBProperties {
-    String dynamodbEndpoint = "http://localhost:8000";
-    String dynamodbRegion = "";
-}
-
 public class DynamoDBKafkaTest {
-
-    private static DynamoDBProxyServer dynamoDBProxyServer;
-    private AmazonDynamoDB amazonDynamoDB;
-    KafkaContainer kafka = new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:6.2.1"));
+    private LocalDynamoDB localDynamoDB = new LocalDynamoDB();
+    private LocalKafka localKafka = new LocalKafka();
     private String VEHICLE_TOPIC = "vehicleRecords";
+    private int numPartitions = 10;
 
     @Before
     public void setUp() throws Exception {
-        startDynamoDB();
-        startKafka();
+        setupDynamoDB();
+        setupKafka();
     }
 
-    private void startKafka() {
-        kafka.start();
-        createTopics(VEHICLE_TOPIC);
+    private void setupDynamoDB() throws Exception {
+        localDynamoDB.start();
+        localDynamoDB.createTables(Arrays.asList(VehicleRecord.class));
     }
 
-    private void startDynamoDB() throws Exception {
-        AwsDynamoDbLocalTestUtils.initSqLite();
-        dynamoDBProxyServer = ServerRunner.createServerFromCommandLineArgs(
-                new String[]{"-inMemory", "-port", "8000"}
-        );
-        dynamoDBProxyServer.start();
-        createAmazonDynamoDBClient();
-        createTables();
+    private void setupKafka() {
+        localKafka.start();
+        localKafka.createTopic(VEHICLE_TOPIC, numPartitions);
     }
 
-    private void createTopics(String... topics) {
-        var newTopics =
-                Arrays.stream(topics)
-                        .map(topic -> new NewTopic(topic, 1, (short) 1))
-                        .collect(Collectors.toList());
-        try (var admin = AdminClient.create(Map.of(BOOTSTRAP_SERVERS_CONFIG, getKafkaBrokers()))) {
-            admin.createTopics(newTopics);
-        }
-    }
-
-    private String getKafkaBrokers() {
-        Integer mappedPort = kafka.getFirstMappedPort();
-        return String.format("%s:%d", "localhost", mappedPort);
-    }
-
-    private void createAmazonDynamoDBClient() {
-        amazonDynamoDB = AmazonDynamoDBClientBuilder.standard()
-                .withEndpointConfiguration(new AwsClientBuilder.EndpointConfiguration(
-                        new DynamoDBProperties().dynamodbEndpoint, new DynamoDBProperties().dynamodbRegion
-                )).build();
-    }
-
-    private void createTables() {
-        var mapper = new DynamoDBMapper(amazonDynamoDB);
-        var tableRequest = mapper.generateCreateTableRequest(VehicleRecord.class);
-        tableRequest.setProvisionedThroughput(new ProvisionedThroughput(100L, 100L));
-        amazonDynamoDB.createTable(tableRequest);
-    }
-
-    @Test
-    public void serDesTest() {
-        VehicleMessage message = new VehicleMessage(1, 1);
-        assertEquals(JsonSerDes.deserialize(JsonSerDes.serialize(message), VehicleMessage.class), message);
-    }
-
-    @Test
-    public void saveRecordsInDynamoDB() {
-        DynamoDBMapper mapper = new DynamoDBMapper(amazonDynamoDB);
-
-        int vin = 1;
-        VehicleRecord vehicleRecord = mapper.load(VehicleRecord.class, vin);
-        if (vehicleRecord == null) {
-            vehicleRecord = new VehicleRecord();
-        }
-        //update vehicle record
-        vehicleRecord.setVin(vin);
-        vehicleRecord.setTyrePressure(100);
-        mapper.save(vehicleRecord);
-
-        VehicleRecord loadedRecord = mapper.load(VehicleRecord.class, vin);
-        assertEquals(loadedRecord.getVersion(), Long.valueOf(1));
-        assertEquals(loadedRecord.getVin(), Integer.valueOf(1));
-        assertEquals(loadedRecord.getTyrePressure(), Integer.valueOf(100));
-    }
 
     //An example pipeline to update records in dynamodb with optimistic locking and retries.
     @Test
-    public void updateWithOptimisticLocking() {
-        int noOfMessages = 100;
-        List<Integer> producedVINs = produceVehicleMessages(noOfMessages);
-        consumeVehicleMessages(noOfMessages);
-        verifyRecordsInDynamoDB(producedVINs);
+    public void updateWithOptimisticLocking() throws InterruptedException, ExecutionException {
+        ExecutorService executor = Executors.newFixedThreadPool(12);
+        int noOfMessagesToProduce = 1000;
+        String groupId = "VehicleGroup";
+
+        executor.submit(()->
+                new Consumer(localKafka, groupId, Arrays.asList(VEHICLE_TOPIC)).consumeVehicleMessages(noOfMessagesToProduce));
+        executor.submit(()->
+                new Consumer(localKafka, groupId, Arrays.asList(VEHICLE_TOPIC)).consumeVehicleMessages(noOfMessagesToProduce));
+
+        var producedVINFuture = executor.submit(()->
+                produceVehicleMessages(noOfMessagesToProduce));
+
+        //
+        executor.submit(()->
+                new Consumer(localKafka, groupId, Arrays.asList(VEHICLE_TOPIC)).consumeVehicleMessages(noOfMessagesToProduce));
+
+        var producedVINs = producedVINFuture.get();
+        TestUtils.waitUntilTrue(
+                ()-> verifyRecordsInDynamoDB(producedVINs), "Waiting to consume all the messages", Duration.ofSeconds(5));
+
     }
 
-    private void verifyRecordsInDynamoDB(List<Integer> producedVINs) {
+    private boolean verifyRecordsInDynamoDB(List<Integer> producedVINs) {
         List<VehicleRecord> dynamoDbRecords = readRecordsFromDynamoDB(producedVINs);
-        assertEquals(producedVINs, dynamoDbRecords.stream().map(r -> r.getVin()).collect(Collectors.toList()));
+        return producedVINs.equals(dynamoDbRecords.stream().filter(r -> r != null).map(r -> r.getVin()).collect(Collectors.toList()));
     }
 
     @NotNull
     private List<VehicleRecord> readRecordsFromDynamoDB(List<Integer> producedVINs) {
-        DynamoDBMapper mapper = new DynamoDBMapper(amazonDynamoDB);
+        DynamoDBMapper mapper = new DynamoDBMapper(localDynamoDB.getClient());
         List<VehicleRecord> dynamoDbRecords = new ArrayList<>();
         for (Integer producedVIN : producedVINs) {
             VehicleRecord record = mapper.load(VehicleRecord.class, producedVIN);
@@ -148,93 +91,93 @@ public class DynamoDBKafkaTest {
         return dynamoDbRecords;
     }
 
-    private void consumeVehicleMessages(int noOfMessagesProduced) {
-        int consumedNoOfMessages = 0;
-        KafkaConsumer<String, byte[]> consumer = createKafkaConsumer();
-        consumer.subscribe(Arrays.asList(VEHICLE_TOPIC));
-        while(consumedNoOfMessages < noOfMessagesProduced) {
-            ConsumerRecords<String, byte[]> fetchedMessages = consumer.poll(1000);
-            consumedNoOfMessages += fetchedMessages.count();
-            System.out.println("fetchedMessages = " + consumedNoOfMessages);
-            updateVehicleRecords(fetchedMessages);
-            //TODO:commit offsets.
-        }
-    }
+    class Consumer {
+        private final KafkaConsumer<String, byte[]> consumer;
+        private String groupId;
+        private final List<String> topics;
+        private LocalKafka kafka;
 
-    private void updateVehicleRecords(ConsumerRecords<String, byte[]> messages) {
-        for (ConsumerRecord<String, byte[]> consumerRecord : messages) {
-            VehicleMessage vehicleMessage = JsonSerDes.deserialize(consumerRecord.value(), VehicleMessage.class);
-            updateVehicleRecordWithRetry(vehicleMessage, consumerRecord.offset());
+        public Consumer(LocalKafka localKafka, String groupId, List<String> topics) {
+            this.kafka = localKafka;
+            this.groupId = groupId;
+            this.topics = topics;
+            this.consumer = localKafka.createKafkaConsumer(groupId);
+            consumer.subscribe(topics);
         }
-    }
 
-    private void updateVehicleRecordWithRetry(VehicleMessage vehicleMessage, long kafkaOffset) {
-        while(true) { //keep trying, will eventually
-            DynamoDBMapper mapper = new DynamoDBMapper(amazonDynamoDB);
-            try {
-                updateRecordInDynamoDB(vehicleMessage, kafkaOffset, mapper);
-                return;
-            } catch (ConditionalCheckFailedException e) {
-                //wait for random duration from 0 - 200ms before retry.
-                randomDelay();
-                e.printStackTrace();
-                //continue with retry.
+
+        private void consumeVehicleMessages(int noOfMessagesProduced) {
+            int consumedNoOfMessages = 0;
+
+            while(consumedNoOfMessages < noOfMessagesProduced) {
+                ConsumerRecords<String, byte[]> fetchedMessages = consumer.poll(Duration.ofMillis(1000));
+                Set<TopicPartition> assignment = consumer.assignment();
+                System.out.println("Group Metadata" + consumer.groupMetadata());
+                System.out.println("Assignment for consumer = " + assignment);
+                consumedNoOfMessages += fetchedMessages.count();
+                System.out.println("fetchedMessages = " + consumedNoOfMessages);
+                Map<TopicPartition, OffsetAndMetadata> offsets = updateVehicleRecords(fetchedMessages);
+                consumer.commitSync(offsets);
+                System.out.println("Committed offsets = " + offsets);
             }
         }
-    }
 
-    private static void randomDelay() {
-        Uninterruptibles.sleepUninterruptibly(new Random().nextLong(0, 200), TimeUnit.MILLISECONDS);
-    }
-
-    private static void updateRecordInDynamoDB(VehicleMessage vehicleMessage, long kafkaOffset, DynamoDBMapper mapper) {
-        VehicleRecord vehicleRecord = mapper.load(VehicleRecord.class, vehicleMessage.getVin());
-        if (vehicleRecord == null) {
-            vehicleRecord = new VehicleRecord();
+        private Map<TopicPartition, OffsetAndMetadata> updateVehicleRecords(ConsumerRecords<String, byte[]> messages) {
+            Map<TopicPartition, OffsetAndMetadata> processedOffsets = new HashMap<>();
+            for (ConsumerRecord<String, byte[]> consumerRecord : messages) {
+                VehicleMessage vehicleMessage = JsonSerDes.deserialize(consumerRecord.value(), VehicleMessage.class);
+                updateVehicleRecordWithRetry(vehicleMessage, consumerRecord.offset());
+                processedOffsets.put(new TopicPartition(consumerRecord.topic(), consumerRecord.partition()), new OffsetAndMetadata(consumerRecord.offset()));
+            }
+            return processedOffsets;
         }
 
-        if (vehicleRecord.offsetAlreadyProcessed(kafkaOffset)) {
-            System.out.println("Offset  " + kafkaOffset + " is already processed + skipping it for " + vehicleRecord.getVin());
-            return;
+        private void updateVehicleRecordWithRetry(VehicleMessage vehicleMessage, long kafkaOffset) {
+            while(true) { //keep trying, will eventually
+                DynamoDBMapper mapper = new DynamoDBMapper(localDynamoDB.getClient());
+                try {
+                    updateRecordInDynamoDB(vehicleMessage, kafkaOffset, mapper);
+                    return;
+                } catch (ConditionalCheckFailedException e) {
+                    //wait for random duration from 0 - 200ms before retry.
+                    randomDelay();
+                    e.printStackTrace();
+                    //continue with retry.
+                }
+            }
         }
 
-        //update vehicle record
-        vehicleRecord.setVin(vehicleMessage.getVin());
-        vehicleRecord.setTyrePressure(vehicleMessage.getTyrePressure());
-        vehicleRecord.setKafkaOffset(kafkaOffset);
+        private static void randomDelay() {
+            Uninterruptibles.sleepUninterruptibly(new Random().nextLong(0, 200), TimeUnit.MILLISECONDS);
+        }
 
-        System.out.println("Updating VehicleRecord = " + vehicleRecord.getVin());
+        private static void updateRecordInDynamoDB(VehicleMessage vehicleMessage, long kafkaOffset, DynamoDBMapper mapper) {
+            VehicleRecord vehicleRecord = mapper.load(VehicleRecord.class, vehicleMessage.getVin());
+            if (vehicleRecord == null) {
+                vehicleRecord = new VehicleRecord();
+            }
 
-        mapper.save(vehicleRecord);
+            if (vehicleRecord.offsetAlreadyProcessed(kafkaOffset)) {
+                System.out.println("Offset  " + kafkaOffset + " is already processed + skipping it for " + vehicleRecord.getVin());
+                return;
+            }
+
+            //update vehicle record
+            vehicleRecord.setVin(vehicleMessage.getVin());
+            vehicleRecord.setTyrePressure(vehicleMessage.getTyrePressure());
+            vehicleRecord.setKafkaOffset(kafkaOffset);
+
+            System.out.println("Updating VehicleRecord = " + vehicleRecord.getVin());
+
+            mapper.save(vehicleRecord);
+        }
+
     }
 
-    @NotNull
-    private KafkaConsumer<String, byte[]> createKafkaConsumer() {
-        var consumer =  new KafkaConsumer<>(
-                Map.of(
-                        ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
-                        kafka.getBootstrapServers(),
-                        ConsumerConfig.GROUP_ID_CONFIG,
-                        "tc-" + UUID.randomUUID(),
-                        ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,
-                        "earliest"),
-                new StringDeserializer(),
-                new ByteArrayDeserializer());
-        return consumer;
-    }
+
 
     private List<Integer> produceVehicleMessages(int noOfMessagesToProduce) {
-        var producer = new KafkaProducer<>(
-                Map.of(
-                        ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
-                        kafka.getBootstrapServers(),
-                        ConsumerConfig.GROUP_ID_CONFIG,
-                        "tc-" + UUID.randomUUID(),
-                        ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,
-                        "earliest"),
-                new StringSerializer(),
-                new ByteArraySerializer());
-
+        var producer = localKafka.createKafkaProducer();
         List<Integer> producedVINs = new ArrayList<>();
         for (int i = 1; i <= noOfMessagesToProduce; i++) {
             int VIN = i;

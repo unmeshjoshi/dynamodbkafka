@@ -1,4 +1,4 @@
-package dynamodbkafka;
+package dynamodbkafka.utils;
 
 import com.google.common.base.Splitter;
 import com.google.common.collect.Lists;
