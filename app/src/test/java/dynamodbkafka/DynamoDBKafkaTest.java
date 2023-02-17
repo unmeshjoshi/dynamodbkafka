@@ -18,10 +18,7 @@ import org.junit.Test;
 
 import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 import static org.junit.Assert.assertEquals;
@@ -30,7 +27,7 @@ public class DynamoDBKafkaTest {
     private LocalDynamoDB localDynamoDB = new LocalDynamoDB();
     private LocalKafka localKafka = new LocalKafka();
     private String VEHICLE_TOPIC = "vehicleRecords";
-    private int numPartitions = 10;
+    private int numPartitions = 100;
 
     @Before
     public void setUp() throws Exception {
@@ -52,7 +49,7 @@ public class DynamoDBKafkaTest {
     //An example pipeline to update records in dynamodb with optimistic locking and retries.
     @Test
     public void updateWithOptimisticLocking() throws InterruptedException, ExecutionException {
-        ExecutorService executor = Executors.newFixedThreadPool(12);
+        ScheduledExecutorService executor = Executors.newScheduledThreadPool(12);
         int noOfMessagesToProduce = 1000;
         String groupId = "VehicleGroup";
 
@@ -64,9 +61,10 @@ public class DynamoDBKafkaTest {
         var producedVINFuture = executor.submit(()->
                 produceVehicleMessages(noOfMessagesToProduce));
 
-        //
-        executor.submit(()->
-                new Consumer(localKafka, groupId, Arrays.asList(VEHICLE_TOPIC)).consumeVehicleMessages(noOfMessagesToProduce));
+        //start third consumer after some time. It will trigger rebalance
+        executor.schedule(()->
+                new Consumer(localKafka, groupId, Arrays.asList(VEHICLE_TOPIC)).consumeVehicleMessages(noOfMessagesToProduce),
+                2, TimeUnit.SECONDS);
 
         var producedVINs = producedVINFuture.get();
         TestUtils.waitUntilTrue(
@@ -92,24 +90,41 @@ public class DynamoDBKafkaTest {
     }
 
     class Consumer {
+        private static int consumerIdGen;
         private final KafkaConsumer<String, byte[]> consumer;
+        private final int consumerId;
         private String groupId;
         private final List<String> topics;
         private LocalKafka kafka;
 
         public Consumer(LocalKafka localKafka, String groupId, List<String> topics) {
+            consumerId = consumerIdGen++;
+
             this.kafka = localKafka;
             this.groupId = groupId;
             this.topics = topics;
             this.consumer = localKafka.createKafkaConsumer(groupId);
-            consumer.subscribe(topics);
+            consumer.subscribe(topics, new ConsumerRebalanceListener() {
+                @Override
+                public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+                    System.out.println("revoked partitions from " + consumerId + "=" + partitions);
+                }
+
+                @Override
+                public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+                    System.out.println("assigned partitions to " + consumerId + "=" + partitions);
+                }
+            });
         }
 
 
         private void consumeVehicleMessages(int noOfMessagesProduced) {
+            System.out.println("Starting to consume messages from " + consumerId);
+
             int consumedNoOfMessages = 0;
 
             while(consumedNoOfMessages < noOfMessagesProduced) {
+
                 ConsumerRecords<String, byte[]> fetchedMessages = consumer.poll(Duration.ofMillis(1000));
                 Set<TopicPartition> assignment = consumer.assignment();
                 System.out.println("Group Metadata" + consumer.groupMetadata());
@@ -117,7 +132,13 @@ public class DynamoDBKafkaTest {
                 consumedNoOfMessages += fetchedMessages.count();
                 System.out.println("fetchedMessages = " + consumedNoOfMessages);
                 Map<TopicPartition, OffsetAndMetadata> offsets = updateVehicleRecords(fetchedMessages);
-                consumer.commitSync(offsets);
+                consumer.commitAsync(offsets, new OffsetCommitCallback() {
+                    @Override
+                    public void onComplete(Map<TopicPartition, OffsetAndMetadata> committedOffsets, Exception exception) {
+                        //TODO: Handle this.
+                        System.out.println("Commit callback for offsets = " + committedOffsets + " Exception=" + exception);
+                    }
+                });
                 System.out.println("Committed offsets = " + offsets);
             }
         }
