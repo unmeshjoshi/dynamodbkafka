@@ -7,6 +7,7 @@ import com.amazonaws.services.dynamodbv2.datamodeling.DynamoDBMapper;
 import com.amazonaws.services.dynamodbv2.model.ConditionalCheckFailedException;
 import com.google.common.util.concurrent.Uninterruptibles;
 import dynamodbkafka.utils.LocalDynamoDB;
+import dynamodbkafka.utils.LocalDynamoDBCotainer;
 import dynamodbkafka.utils.LocalKafka;
 import dynamodbkafka.utils.TestUtils;
 import org.apache.kafka.clients.consumer.*;
@@ -24,7 +25,8 @@ import java.util.stream.Collectors;
 import static org.junit.Assert.assertEquals;
 
 public class DynamoDBKafkaTest {
-    private LocalDynamoDB localDynamoDB = new LocalDynamoDB();
+//    private LocalDynamoDB localDynamoDB = new LocalDynamoDB();
+    private LocalDynamoDBCotainer localDynamoDB = new LocalDynamoDBCotainer();
     private LocalKafka localKafka = new LocalKafka();
     private String VEHICLE_TOPIC = "vehicleRecords";
     private int numPartitions = 100;
